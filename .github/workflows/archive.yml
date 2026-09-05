@@ -1,0 +1,91 @@
+name: Mock Archiver
+
+on:
+  schedule:
+    # Every 3 hours. The archive is incremental - each run picks up whatever is
+    # new since the last cursor - so there is no reason to run it more often, and
+    # a lower frequency keeps well inside the new account's D1 write budget.
+    - cron: '0 */3 * * *'
+  repository_dispatch:
+    types: [archive]
+  workflow_dispatch:
+    inputs:
+      units:
+        description: 'Max units this run (0 = until the budget runs out)'
+        required: false
+        default: '0'
+
+jobs:
+  archive:
+    runs-on: ubuntu-latest
+    # 59 rather than 360: the archiver holds a 30-minute lease per unit, so a job
+    # killed at the limit must not have been holding a claim for longer than the
+    # lease, or the unit stays locked until it expires.
+    timeout-minutes: 59
+    # `actions: write` lets the final step dispatch the NEXT run via
+    # `gh workflow run` - runs are self-chaining while work remains, instead of
+    # idling up to 3 h until the next cron tick. contents: read is the checkout.
+    permissions:
+      contents: read
+      actions: write
+    concurrency:
+      # ONE archiver at a time, globally. Unlike the course migration this fleet
+      # has a single Telegram account: a second concurrent run would connect the
+      # same session from a second place and Telegram would invalidate the auth
+      # key (AuthKeyDuplicatedError), taking the account offline.
+      group: mock-archiver
+      cancel-in-progress: false
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install deps
+        run: pip install -r github-action/requirements.txt
+
+      - name: Run archiver
+        env:
+          TG_API_ID: ${{ secrets.TG_API_ID }}
+          TG_API_HASH: ${{ secrets.TG_API_HASH }}
+          # StringSession for the archiver account (+91905190xxxx). A .session
+          # file cannot be committed, so CI must get the string form.
+          MOCK_SESSION: ${{ secrets.MOCK_SESSION }}
+          # Scoped D1 token for the mock database's own Cloudflare account. The
+          # mock tables are deliberately NOT in the migration's account: the
+          # 100k/day row-write cap is per account and the migration uses all of
+          # it, which silently stopped every mock write with error 7500.
+          MOCK_CF_TOKEN: ${{ secrets.MOCK_CF_TOKEN }}
+          MOCK_CF_ACCOUNT: ${{ secrets.MOCK_CF_ACCOUNT }}
+          MOCK_CF_DB: ${{ secrets.MOCK_CF_DB }}
+          GH_TOKEN_VALUE: ${{ secrets.ARCHIVE_GH_TOKEN }}
+          GH_OWNER: ${{ secrets.ARCHIVE_GH_OWNER }}
+          GH_REPO: ${{ secrets.ARCHIVE_GH_REPO }}
+          # 48 under a 59-minute kill, matching the migration: leaves 11 minutes
+          # for a slow final upload plus the release of the claim.
+          MOCK_BUDGET_MIN: '48'
+          MOCK_MAX_UNITS: ${{ github.event.inputs.units || '0' }}
+          # Unbuffered. print() to a non-TTY is 8 KB block-buffered, so a job
+          # SIGKILLed at timeout-minutes loses its entire log and looks like an
+          # instant crash. This cost several wasted debugging turns on the course
+          # migration; included here from the first run.
+          PYTHONUNBUFFERED: '1'
+        run: python archive.py
+
+      # Self-chaining: when this run ends and units still have work, dispatch the
+      # next run immediately instead of idling until the next cron tick. Stops
+      # on completion, on the pause gate, or on a 30-min cooldown (chain_next.py
+      # explains each case). if: always() so it also runs after a failure - a
+      # crashed run must still hand over to a fresh one.
+      - name: Chain next run when work remains
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # chain_next.py counts remaining units in D1 before dispatching.
+          MOCK_CF_TOKEN: ${{ secrets.MOCK_CF_TOKEN }}
+          MOCK_CF_ACCOUNT: ${{ secrets.MOCK_CF_ACCOUNT }}
+          MOCK_CF_DB: ${{ secrets.MOCK_CF_DB }}
+        run: python chain_next.py

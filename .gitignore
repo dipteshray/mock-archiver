@@ -1,0 +1,15 @@
+# Secrets - never committed
+_gh_token.txt
+_mock_cf_token.txt
+_session_string_archiver.txt
+_login_hash_archiver.txt
+*.session
+*.session-journal
+
+# Local working state
+downloads/
+run.log
+run.err
+__pycache__/
+*.pyc
+_gh_stage/
